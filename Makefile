@@ -30,6 +30,10 @@ runfast: run.c
 	$(CC) -Ofast -o run run.c -lm
 	$(CC) -Ofast -o runq runq.c -lm
 
+.PHONY: runmt
+runmt: run-mt.c
+	$(CC) -Ofast -o run run-mt.c -lm
+
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
 # OMP_NUM_THREADS=4 ./run out/model.bin
