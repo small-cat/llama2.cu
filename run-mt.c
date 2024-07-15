@@ -1,4 +1,9 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-2 Transformer model in pure C
+ * With added CUDA support initially drawing from
+ * https://github.com/ankan-ban/llama2.cu/blob/master/llama2.cu
+ * and structured in a way that hopefully makes keeping it
+ * up-to-date straightforward.
+ */
 
 #include <ctype.h>
 #include <fcntl.h>
@@ -12,6 +17,50 @@
 #else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+
+#include "mt-vec.h"
+#include <time.h>
+
+long llama_time_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long)(ts.tv_sec * 1000) + (long)(ts.tv_nsec / 1000000);
+}
+
+#ifdef USE_CUDA
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
+#include <cub/cub.cuh>
+
+// Each CUDA function call should be checked for errors.
+#define CUCHK(err) cuda_check((err), __FILE__, __LINE__)
+inline void cuda_check(cudaError_t error_code, const char* file, int line) {
+  if (error_code != cudaSuccess) {
+    fprintf(stderr, "CUDA Error %d: %s. In file '%s' on line %d\n", error_code,
+            cudaGetErrorString(error_code), file, line);
+    fflush(stderr);
+    exit(error_code);
+  }
+}
+
+cublasHandle_t g_cublas_handle = nullptr;
+
+void create_cublas_handle() {
+  cublasStatus_t stat = cublasCreate(&g_cublas_handle);  // FIXME cublasDestroy
+  if (stat != CUBLAS_STATUS_SUCCESS) {
+    printf("CUBLAS initialization failed\n");
+    exit(EXIT_FAILURE);
+  }
+}
+void destroy_cublas_handle() {
+  cublasStatus_t stat = cublasDestroy(g_cublas_handle);
+  if (stat != CUBLAS_STATUS_SUCCESS) {
+    printf("CUBLAS initialization failed\n");
+    exit(EXIT_FAILURE);
+  }
+}
 #endif
 
 // ----------------------------------------------------------------------------
@@ -28,6 +77,12 @@ typedef struct {
   int seq_len;     // max sequence length
 } Config;
 
+// CUDA NOTE: The TransformerWeights structure will be stored on the host,
+// but all of the pointers in the structure will point to data on the GPU.
+// The checkpoint file is mmap-ed to the host and the weights portion
+// is allocated on and copied to the GPU.  Then, memory_map_weights() updates
+// these structure pointers to point to the proper location.  Happily, this
+// function is the same for both C and CUDA.
 typedef struct {
   // token embedding table
   float* token_embedding_table;  // (vocab_size, dim)
@@ -49,18 +104,26 @@ typedef struct {
   float* wcls;
 } TransformerWeights;
 
+// CUDA NOTE: The RunState structure will be stored on the host, but all of the
+// pointers in the structure will point to data on the GPU, created via
+// cudaMalloc.  The exception is logits which is the final result of the
+// transformer & is copied from the GPU as the last step in the transformer
+// and is used by the host.
 typedef struct {
   // current wave of activations
-  float* x;       // activation at current time stamp (dim,)
-  float* xb;      // same, but inside a residual branch (dim,)
-  float* xb2;     // an additional buffer just for convenience (dim,)
-  float* hb;      // buffer for hidden dimension in the ffn (hidden_dim,)
-  float* hb2;     // buffer for hidden dimension in the ffn (hidden_dim,)
-  float* q;       // query (dim,)
-  float* k;       // key (dim,)
-  float* v;       // value (dim,)
-  float* att;     // buffer for scores/attention values (n_heads, seq_len)
-  float* logits;  // output logits
+  float* x;    // activation at current time stamp (dim,)
+  float* xb;   // same, but inside a residual branch (dim,)
+  float* xb2;  // an additional buffer just for convenience (dim,)
+  float* hb;   // buffer for hidden dimension in the ffn (hidden_dim,)
+  float* hb2;  // buffer for hidden dimension in the ffn (hidden_dim,)
+  float* q;    // query (dim,)
+  float* k;    // key (dim,)
+  float* v;    // value (dim,)
+  float* att;  // buffer for scores/attention values (n_heads, seq_len)
+#ifdef USE_CUDA
+  float* logits_gpu;  // output logits in GPU
+#endif
+  float* logits;  // output logits in CPU
   // kv cache
   float* key_cache;    // (layer, seq_len, dim)
   float* value_cache;  // (layer, seq_len, dim)
@@ -76,19 +139,47 @@ typedef struct {
   ssize_t file_size;  // size of the checkpoint file in bytes
 } Transformer;
 
+#ifdef USE_CUDA
 void malloc_run_state(RunState* s, Config* p) {
   // we calloc instead of malloc to keep valgrind happy
   int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-  s->x = calloc(p->dim, sizeof(float));
-  s->xb = calloc(p->dim, sizeof(float));
-  s->xb2 = calloc(p->dim, sizeof(float));
-  s->hb = calloc(p->hidden_dim, sizeof(float));
-  s->hb2 = calloc(p->hidden_dim, sizeof(float));
-  s->q = calloc(p->dim, sizeof(float));
-  s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-  s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-  s->logits = calloc(p->vocab_size, sizeof(float));
+  CUCHK(cudaMalloc((void**)&s->x, p->dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->xb, p->dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->xb2, p->dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->hb, p->hidden_dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->hb2, p->hidden_dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->q, p->dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->key_cache,
+                   p->n_layers * p->seq_len * kv_dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->value_cache,
+                   p->n_layers * p->seq_len * kv_dim * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->att, p->n_heads * p->seq_len * sizeof(float)));
+  CUCHK(cudaMalloc((void**)&s->logits_gpu, p->vocab_size * sizeof(float)));
+  s->logits = (float*)calloc(p->vocab_size, sizeof(float));
+  // ensure all mallocs went fine
+  if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
+      !s->key_cache || !s->value_cache || !s->att || !s->logits_gpu ||
+      !s->logits) {
+    fprintf(stderr, "malloc failed!\n");
+    exit(EXIT_FAILURE);
+  }
+}
+#else
+void malloc_run_state(RunState* s, Config* p) {
+  // we calloc instead of malloc to keep valgrind happy
+  int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+  s->x = (float*)calloc(p->dim, sizeof(float));
+  s->xb = (float*)calloc(p->dim, sizeof(float));
+  s->xb2 = (float*)calloc(p->dim, sizeof(float));
+  s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
+  s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
+  s->q = (float*)calloc(p->dim, sizeof(float));
+  s->key_cache =
+      (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->value_cache =
+      (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+  s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
+  s->logits = (float*)calloc(p->vocab_size, sizeof(float));
   // ensure all mallocs went fine
   if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q ||
       !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -96,7 +187,23 @@ void malloc_run_state(RunState* s, Config* p) {
     exit(EXIT_FAILURE);
   }
 }
+#endif
 
+#ifdef USE_CUDA
+void free_run_state(RunState* s) {
+  CUCHK(cudaFree(s->x));
+  CUCHK(cudaFree(s->xb));
+  CUCHK(cudaFree(s->xb2));
+  CUCHK(cudaFree(s->hb));
+  CUCHK(cudaFree(s->hb2));
+  CUCHK(cudaFree(s->q));
+  CUCHK(cudaFree(s->att));
+  CUCHK(cudaFree(s->logits_gpu));
+  free(s->logits);
+  CUCHK(cudaFree(s->key_cache));
+  CUCHK(cudaFree(s->value_cache));
+}
+#else
 void free_run_state(RunState* s) {
   free(s->x);
   free(s->xb);
@@ -109,6 +216,7 @@ void free_run_state(RunState* s) {
   free(s->key_cache);
   free(s->value_cache);
 }
+#endif
 
 void memory_map_weights(TransformerWeights* w, Config* p, float* ptr,
                         int shared_weights) {
@@ -170,12 +278,23 @@ void read_checkpoint(char* checkpoint, Config* config,
     fprintf(stderr, "open failed!\n");
     exit(EXIT_FAILURE);
   }
-  *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+  *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
   if (*data == MAP_FAILED) {
     fprintf(stderr, "mmap failed!\n");
     exit(EXIT_FAILURE);
   }
+#ifdef USE_CUDA
+  // allocate & copy mmap data to the gpu first
+  // TODO: allocate & copy just a portion to the GPU if the weights are too big
+  // to fit in the GPU, then copy the data only as needed while running.
+  float* weights_ptr;
+  size_t weights_size = *file_size - sizeof(Config);
+  CUCHK(cudaMalloc((void**)&weights_ptr, weights_size));
+  CUCHK(cudaMemcpy(weights_ptr, *data + sizeof(Config) / sizeof(float),
+                   weights_size, cudaMemcpyHostToDevice));
+#else
   float* weights_ptr = *data + sizeof(Config) / sizeof(float);
+#endif
   memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
@@ -195,12 +314,92 @@ void free_transformer(Transformer* t) {
   if (t->fd != -1) {
     close(t->fd);
   }
+#ifdef USE_CUDA
+  // we cudaMalloc a region of memory, then hand the address to
+  // the token_embedding_table field.  Free it here.
+  CUCHK(cudaFree(t->weights.token_embedding_table));
+#endif
   // free the RunState buffers
   free_run_state(&t->state);
 }
 
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
+
+#ifdef USE_CUDA
+// Utility routine to divide a into ceiling of b parts
+int divUp(int a, int b) { return (a - 1) / b + 1; }
+
+const int num_threads_lrg = 1024;
+const int num_threads_med = 256;
+
+__global__ void rmsnorm_kernel(float* o, float* x, float* weight, int size,
+                               int elementsPerThread) {
+  // parallel reduction of sum of squares via CUB
+  float ss = 0.0f;
+  for (int i = 0; i < elementsPerThread; i++) {
+    int j = threadIdx.x + i * num_threads_lrg;
+    if (j < size) ss += x[j] * x[j];
+  }
+  using BlockReduce = cub::BlockReduce<float, num_threads_lrg>;
+  __shared__ typename BlockReduce::TempStorage temp;
+  ss = BlockReduce(temp).Sum(ss);
+
+  // serialization point to calculate normalization factor
+  __shared__ float shared_ss;
+  if (threadIdx.x == 0) {
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    shared_ss = ss;
+  }
+  __syncthreads();
+  ss = shared_ss;
+
+  // normalize and scale
+  for (int i = 0; i < elementsPerThread; i++) {
+    int j = threadIdx.x + i * num_threads_lrg;
+    if (j < size) {
+      o[j] = weight[j] * (ss * x[j]);
+    }
+  }
+}
+void rmsnorm(float* o, float* x, float* weight, int size) {
+  int elementsPerThread = divUp(size, num_threads_lrg);
+  rmsnorm_kernel<<<1, num_threads_lrg>>>(o, x, weight, size, elementsPerThread);
+}
+#else
+
+#ifdef USE_VECTORIZE
+inline static void llama_vec_scale_mul_f32(const int n, float* x, float* w,
+                                           const float scale) {
+  // for (int i = 0; i < n; i++) {
+  //   x[i] = x[i] * scale * w[i];
+  // }
+  const int np = (n & ~(GGML_F32_STEP - 1));  // n / GGML_F32_STEP
+  GGML_F32_VEC vx = GGML_F32_VEC_SET1(
+      scale);  // vx is a vector contains number of 16 floats all equal to scale
+  GGML_F32_VEC aw[GGML_F32_ARR];  // store input weights
+  GGML_F32_VEC ax[GGML_F32_ARR];  // store input x
+
+  // GGML_F32_STEP = GGML_F32_ARR * GGML_F32_EPR
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+      ax[j] = GGML_F32_VEC_MUL(ax[j], vx);  // xi * scale
+
+      aw[j] = GGML_F32_VEC_LOAD(w + i + j * GGML_F32_EPR);
+      ax[j] = GGML_F32_VEC_MUL(ax[j], aw[j]); // xi * scale * wi
+
+      GGML_F32_VEC_STORE(x + i + j * GGML_F32_EPR, ax[j]);
+    }
+  }
+
+  // the remains elements
+  for (int i = np; i < n; i++) {
+    x[i] = x[i] * scale * w[i];
+  }
+}
 
 // 1 / sqrt(sum(xi ^ xi)/size + epsilon) * xi * wi
 // llama.cpp wrap above to llm_build_norm, consist of three node
@@ -209,19 +408,80 @@ void free_transformer(Transformer* t) {
 // 3. add bias if bias is not null
 void rmsnorm(float* o, float* x, float* weight, int size) {
   // calculate sum of squares
+  long start = llama_time_ms();
   float ss = 0.0f;
   for (int j = 0; j < size; j++) {
     ss += x[j] * x[j];
+    o[j] = x[j];
   }
   ss /= size;
   ss += 1e-5f;
   ss = 1.0f / sqrtf(ss);
-  // normalize and scale
-  for (int j = 0; j < size; j++) {
-    o[j] = weight[j] * (ss * x[j]);
+
+  llama_vec_scale_mul_f32(size, o, weight, ss);
+
+  long end = llama_time_ms();
+  // printf("rmsnorm time: %ld ms\n", end - start);
+}
+#else
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    // calculate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    // normalize and scale
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * (ss * x[j]);
+    }
+}
+#endif // USE_VECTORIZE
+#endif
+
+#ifdef USE_CUDA
+__device__ void softmax_gpu(float* __restrict__ x, int size) {
+  int tid = threadIdx.x;
+  int step = blockDim.x;
+
+  // find max value (for numerical stability)
+  float max_val = tid < size ? x[tid] : 0;
+  for (int i = tid + step; i < size; i += step) {
+    if (x[i] > max_val) {
+      max_val = x[i];
+    }
+  }
+  using BlockReduce = cub::BlockReduce<float, num_threads_lrg>;
+  __shared__ typename BlockReduce::TempStorage temp;
+  __shared__ float shared_val;
+  max_val = BlockReduce(temp).Reduce(max_val, cub::Max());
+  if (threadIdx.x == 0) {
+    shared_val = max_val;
+  }
+  __syncthreads();
+  max_val = shared_val;
+
+  // exp and sum
+  float sum = 0.0f;
+  for (int i = tid; i < size; i += step) {
+    x[i] = expf(x[i] - max_val);
+    sum += x[i];
+  }
+  sum = BlockReduce(temp).Sum(sum);
+  if (threadIdx.x == 0) {
+    shared_val = sum;
+  }
+  __syncthreads();
+  sum = shared_val;
+
+  // normalize
+  for (int i = tid; i < size; i += step) {
+    x[i] /= sum;
   }
 }
-
+#endif
 void softmax(float* x, int size) {
   // find max value (for numerical stability)
   float max_val = x[0];
@@ -242,6 +502,22 @@ void softmax(float* x, int size) {
   }
 }
 
+#ifdef USE_CUDA
+// Use cuBLAS for matmul to leverage this included, high-performance library.
+void matmul(float* xout, float* x, float* w, int n, int d) {
+  // W (d,n) @ x (n,) -> xout (d,)
+  // W is stored in this order: (n=0,d=0), (n=1,d=0), (n=2,d=0), ...
+  // so W is n x d in cublas terms & we'll need to transpose.
+  // Sgemv does y = alpha * op(A) * x + beta * y (modifying y)
+  //   where op can transpose the matrix A
+  // Translating to our local vars, that is
+  // xout = 1.0*op(w)*x + 0.0*xout
+  float alpha = 1.0f;
+  float beta = 0.0f;  // when this is 0, xout will not be used for input
+  cublasSgemv(g_cublas_handle, CUBLAS_OP_T, n, d, &alpha, w, n, x, 1, &beta,
+              xout, 1);
+}
+#else
 void matmul(float* xout, float* x, float* w, int n, int d) {
   // W (d,n) @ x (n,) -> xout (d,)
   // by far the most amount of time is spent inside this little function
@@ -255,6 +531,200 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     xout[i] = val;
   }
 }
+#endif
+
+// Additional neural net blocks (brought out from transformer function)
+#ifdef USE_CUDA
+__global__ void RoPe_rotation_kernel(int pos, float* sq, float* sk, int kv_dim,
+                                     int head_size) {
+  int i = threadIdx.x * 2;
+  int head_dim = i % head_size;
+  float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+  float val = pos * freq;
+  float fcr = cosf(val);
+  float fci = sinf(val);
+  int rotn = i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
+  for (int v = 0; v < rotn; v++) {
+    float* vec = v == 0 ? sq : sk;  // the vector to rotate (query or key)
+    float v0 = vec[i];
+    float v1 = vec[i + 1];
+    vec[i] = v0 * fcr - v1 * fci;
+    vec[i + 1] = v0 * fci + v1 * fcr;
+  }
+}
+void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size) {
+  RoPe_rotation_kernel<<<1, dim / 2>>>(pos, s->q, s->k, kv_dim, head_size);
+}
+#else
+void RoPe_rotation(
+    int pos, RunState* s, int dim, int kv_dim,
+    int head_size) {  // s->q, s->k, freq_cis_real_row, freq_cis_imag_row,
+                      // p->n_heads, head_size) {
+  for (int i = 0; i < dim; i += 2) {
+    int head_dim = i % head_size;
+    float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    float val = pos * freq;
+    float fcr = cosf(val);
+    float fci = sinf(val);
+    int rotn = i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
+    for (int v = 0; v < rotn; v++) {
+      float* vec = v == 0 ? s->q : s->k;  // the vector to rotate (query or key)
+      float v0 = vec[i];
+      float v1 = vec[i + 1];
+      vec[i] = v0 * fcr - v1 * fci;
+      vec[i + 1] = v0 * fci + v1 * fcr;
+    }
+  }
+}
+#endif
+
+#ifdef USE_CUDA
+// TODO refactor vs C code
+__global__ void multi_head_attention_kernel(
+    int pos, int seq_len, float* sq, float* satt, float* sxb, float* key_cache,
+    float* value_cache, int kv_dim, int kv_mul, int head_size, int loff) {
+  int h = blockIdx.x;
+  // get the query vector for this head
+  float* q = sq + h * head_size;
+  // attention scores for this head
+  float* att = satt + h * seq_len;
+  // iterate over all timesteps, including the current one
+  // In CUDA, each thread does a small portion of the calc
+  for (int t = threadIdx.x; t <= pos; t += blockDim.x) {
+    // get the key vector for this head and at this timestep
+    float* k = key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+    // calculate the attention score as the dot product of q and k
+    float score = 0.0f;
+    for (int i = 0; i < head_size; i++) {
+      score += q[i] * k[i];
+    }
+    score /= sqrtf(head_size);
+    // save the score to the attention buffer
+    att[t] = score;
+  }
+  // above was this threads portion of the iteration.  wait for all threads to
+  // finish
+  __syncthreads();
+
+  // softmax the scores to get attention weights, from 0..pos inclusively
+  softmax_gpu(att, pos + 1);
+  __syncthreads();
+
+  // weighted sum of the values, store back into xb
+  // NOTE: by swapping the order of the for loops (vs. C) a simpler
+  // version of the code accomplishes the same task and fits more
+  // naturally with the CUDA way of subdividing the problem.
+  float* xb = sxb + h * head_size;
+  for (int i = threadIdx.x; i < head_size; i += blockDim.x) {
+    float val = 0.0f;
+    for (int t = 0; t <= pos; t++) {
+      // get the value vector for this head and at this timestep
+      float* v = value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      // get the attention weight for this timestep
+      float a = att[t];
+      val += a * v[i];
+    }
+    xb[i] = val;
+  }
+}
+void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
+                          int kv_mul, int head_size, int loff) {
+  multi_head_attention_kernel<<<p->n_heads, num_threads_lrg>>>(
+      pos, p->seq_len, s->q, s->att, s->xb, s->key_cache, s->value_cache,
+      kv_dim, kv_mul, head_size, loff);
+}
+#else
+void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
+                          int kv_mul, int head_size, int loff) {
+  int h;
+#pragma omp parallel for private(h)
+  for (h = 0; h < p->n_heads; h++) {
+    // get the query vector for this head
+    float* q = s->q + h * head_size;
+    // attention scores for this head
+    float* att = s->att + h * p->seq_len;
+    // iterate over all timesteps, including the current one
+    for (int t = 0; t <= pos; t++) {
+      // get the key vector for this head and at this timestep
+      float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      // calculate the attention score as the dot product of q and k
+      float score = 0.0f;
+      for (int i = 0; i < head_size; i++) {
+        score += q[i] * k[i];
+      }
+      score /= sqrtf(head_size);
+      // save the score to the attention buffer
+      att[t] = score;
+    }
+
+    // softmax the scores to get attention weights, from 0..pos inclusively
+    softmax(att, pos + 1);
+
+    // weighted sum of the values, store back into xb
+    float* xb = s->xb + h * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    for (int t = 0; t <= pos; t++) {
+      // get the value vector for this head and at this timestep
+      float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      // get the attention weight for this timestep
+      float a = att[t];
+      // accumulate the weighted value into xb
+      for (int i = 0; i < head_size; i++) {
+        xb[i] += a * v[i];
+      }
+    }
+  }
+}
+#endif
+
+#ifdef USE_CUDA
+__global__ void f_silu_elementwise_mul_w3_kernel(float* shb, float* shb2,
+                                                 int hidden_dim) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < hidden_dim) {
+    float val = shb[i];
+    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+    val *= (1.0f / (1.0f + expf(-val)));
+    // elementwise multiply with w3(x)
+    val *= shb2[i];
+    shb[i] = val;
+  }
+}
+void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim) {
+  f_silu_elementwise_mul_w3_kernel<<<divUp(hidden_dim, num_threads_med),
+                                     num_threads_med>>>(s->hb, s->hb2,
+                                                        hidden_dim);
+}
+#else
+void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim) {
+  for (int i = 0; i < hidden_dim; i++) {
+    float val = s->hb[i];
+    // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
+    val *= (1.0f / (1.0f + expf(-val)));
+    // elementwise multiply with w3(x)
+    val *= s->hb2[i];
+    s->hb[i] = val;
+  }
+}
+#endif
+
+#ifdef USE_CUDA
+__global__ void accum_kernel(float* a, float* b, int size) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < size) {
+    a[i] += b[i];
+  }
+}
+void accum(float* a, float* b, int size) {
+  accum_kernel<<<divUp(size, num_threads_med), num_threads_med>>>(a, b, size);
+}
+#else
+void accum(float* a, float* b, int size) {
+  for (int i = 0; i < size; i++) {
+    a[i] += b[i];
+  }
+}
+#endif
 
 float* forward(Transformer* transformer, int token, int pos) {
   // a few convenience variables
@@ -272,7 +742,11 @@ float* forward(Transformer* transformer, int token, int pos) {
 
   // copy the token embedding into x
   float* content_row = w->token_embedding_table + token * dim;
+#ifdef USE_CUDA
+  CUCHK(cudaMemcpy(x, content_row, dim * sizeof(*x), cudaMemcpyHostToDevice));
+#else
   memcpy(x, content_row, dim * sizeof(*x));
+#endif
 
   // forward all the layers
   for (unsigned long long l = 0; l < p->n_layers; l++) {
@@ -292,71 +766,16 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // RoPE relative positional encoding: complex-valued rotate q and k in each
     // head
-    for (int i = 0; i < dim; i += 2) {
-      int head_dim = i % head_size;
-      float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
-      float val = pos * freq;
-      float fcr = cosf(val);
-      float fci = sinf(val);
-      int rotn = i < kv_dim ? 2 : 1;  // how many vectors? 2 = q & k, 1 = q only
-      for (int v = 0; v < rotn; v++) {
-        float* vec =
-            v == 0 ? s->q : s->k;  // the vector to rotate (query or key)
-        float v0 = vec[i];
-        float v1 = vec[i + 1];
-        vec[i] = v0 * fcr - v1 * fci;
-        vec[i + 1] = v0 * fci + v1 * fcr;
-      }
-    }
+    RoPe_rotation(pos, s, dim, kv_dim, head_size);
 
     // multihead attention. iterate over all heads
-    int h;
-#pragma omp parallel for private(h)
-    for (h = 0; h < p->n_heads; h++) {
-      // get the query vector for this head
-      float* q = s->q + h * head_size;
-      // attention scores for this head
-      float* att = s->att + h * p->seq_len;
-      // iterate over all timesteps, including the current one
-      for (int t = 0; t <= pos; t++) {
-        // get the key vector for this head and at this timestep
-        float* k = s->key_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // calculate the attention score as the dot product of q and k
-        float score = 0.0f;
-        for (int i = 0; i < head_size; i++) {
-          score += q[i] * k[i];
-        }
-        score /= sqrtf(head_size);
-        // save the score to the attention buffer
-        att[t] = score;
-      }
-
-      // softmax the scores to get attention weights, from 0..pos inclusively
-      softmax(att, pos + 1);
-
-      // weighted sum of the values, store back into xb
-      float* xb = s->xb + h * head_size;
-      memset(xb, 0, head_size * sizeof(float));
-      for (int t = 0; t <= pos; t++) {
-        // get the value vector for this head and at this timestep
-        float* v =
-            s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-        // get the attention weight for this timestep
-        float a = att[t];
-        // accumulate the weighted value into xb
-        for (int i = 0; i < head_size; i++) {
-          xb[i] += a * v[i];
-        }
-      }
-    }
+    multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff);
 
     // final matmul to get the output of the attention
     matmul(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim);
 
     // residual connection back into x
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb2[i];
-    }
+    accum(x, s->xb2, dim);
 
     // ffn rmsnorm
     rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
@@ -367,29 +786,26 @@ float* forward(Transformer* transformer, int token, int pos) {
     matmul(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim);
 
     // SwiGLU non-linearity
-    for (int i = 0; i < hidden_dim; i++) {
-      float val = s->hb[i];
-      // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-      val *= (1.0f / (1.0f + expf(-val)));
-      // elementwise multiply with w3(x)
-      val *= s->hb2[i];
-      s->hb[i] = val;
-    }
+    f_silu_elementwise_mul_w3(s, hidden_dim);
 
     // final matmul to get the output of the ffn
     matmul(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim);
 
     // residual connection
-    for (int i = 0; i < dim; i++) {
-      x[i] += s->xb[i];
-    }
+    accum(x, s->xb, dim);
   }
 
   // final rmsnorm
   rmsnorm(x, x, w->rms_final_weight, dim);
 
   // classifier into logits
+#ifdef USE_CUDA
+  matmul(s->logits_gpu, x, w->wcls, p->dim, p->vocab_size);
+  CUCHK(cudaMemcpy(s->logits, s->logits_gpu, p->vocab_size * sizeof(float),
+                   cudaMemcpyDeviceToHost));
+#else
   matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+#endif
   return s->logits;
 }
 
@@ -502,9 +918,15 @@ void safe_printf(char* piece) {
 int str_lookup(char* str, TokenIndex* sorted_vocab, int vocab_size) {
   // efficiently find the perfect match for str in vocab, return its index or -1
   // if not found
+#if defined USE_CUDA && defined _WIN32
+  // CUDA on Windows was not capable of handling the syntax below
+  TokenIndex tok;
+  tok.str = str;
+#else
   TokenIndex tok = {.str = str};  // acts as the key to search for
-  TokenIndex* res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex),
-                            compare_tokens);
+#endif
+  TokenIndex* res = (TokenIndex*)bsearch(&tok, sorted_vocab, vocab_size,
+                                         sizeof(TokenIndex), compare_tokens);
   return res != NULL ? res->id : -1;
 }
 
@@ -520,7 +942,7 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
 
   if (t->sorted_vocab == NULL) {
     // lazily malloc and sort the vocabulary
-    t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+    t->sorted_vocab = (TokenIndex*)malloc(t->vocab_size * sizeof(TokenIndex));
     for (int i = 0; i < t->vocab_size; i++) {
       t->sorted_vocab[i].str = t->vocab[i];
       t->sorted_vocab[i].id = i;
@@ -531,7 +953,8 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
   // create a temporary buffer that will store merge candidates of always two
   // consecutive tokens *2 for concat, +1 for null terminator +2 for UTF8 (in
   // case max_token_length is 1)
-  char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+  char* str_buffer =
+      (char*)malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
   size_t str_len = 0;
 
   // start at 0 tokens
@@ -546,7 +969,7 @@ void encode(Tokenizer* t, char* text, int8_t bos, int8_t eos, int* tokens,
   // the energy to read more of the sentencepiece code to figure out what it's
   // doing
   if (text[0] != '\0') {
-    int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+    int dummy_prefix = str_lookup((char*)" ", t->sorted_vocab, t->vocab_size);
     tokens[(*n_tokens)++] = dummy_prefix;
   }
 
@@ -741,7 +1164,8 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature,
   sampler->topp = topp;
   sampler->rng_state = rng_seed;
   // buffer only used with nucleus sampling; may not need but it's ~small
-  sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+  sampler->probindex =
+      (ProbIndex*)malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler* sampler) { free(sampler->probindex); }
@@ -800,7 +1224,7 @@ long time_in_ms() {
 
 void generate(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
               char* prompt, int steps) {
-  char* empty_prompt = "";
+  char* empty_prompt = (char*)"";
   if (prompt == NULL) {
     prompt = empty_prompt;
   }
@@ -1000,7 +1424,7 @@ void error_usage() {
 int main(int argc, char* argv[]) {
   // default parameters
   char* checkpoint_path = NULL;  // e.g. out/model.bin
-  char* tokenizer_path = "tokenizer.bin";
+  char* tokenizer_path = (char*)"tokenizer.bin";
   float temperature =
       1.0f;  // 0.0 = greedy deterministic. 1.0 = original. don't set higher
   float topp =
@@ -1008,9 +1432,9 @@ int main(int argc, char* argv[]) {
   int steps = 256;                  // number of steps to run for
   char* prompt = NULL;              // prompt string
   unsigned long long rng_seed = 0;  // seed rng with time by default
-  char* mode = "generate";          // generate|chat
+  char* mode = (char*)"generate";   // generate|chat
   char* system_prompt =
-      NULL;  // the (optional) system prompt to use in chat mode
+      (char*)NULL;  // the (optional) system prompt to use in chat mode
 
   // poor man's C argparse so we can override the defaults above from the
   // command line
@@ -1073,6 +1497,10 @@ int main(int argc, char* argv[]) {
   build_sampler(&sampler, transformer.config.vocab_size, temperature, topp,
                 rng_seed);
 
+#ifdef USE_CUDA
+  create_cublas_handle();
+#endif
+
   // run!
   if (strcmp(mode, "generate") == 0) {
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
@@ -1087,6 +1515,9 @@ int main(int argc, char* argv[]) {
   free_sampler(&sampler);
   free_tokenizer(&tokenizer);
   free_transformer(&transformer);
+#ifdef USE_CUDA
+  destroy_cublas_handle();
+#endif
   return 0;
 }
 #endif

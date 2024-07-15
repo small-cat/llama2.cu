@@ -30,9 +30,9 @@ runfast: run.c
 	$(CC) -Ofast -o run run.c -lm
 	$(CC) -Ofast -o runq runq.c -lm
 
-.PHONY: runmt
-runmt: run-mt.c
-	$(CC) -Ofast -o run run-mt.c -lm
+.PHONY: run-vecmt
+run-vecmt: run-vec-mt.c
+	$(CC) -DUSE_VECTORIZE -O3 -o runmt run-vec-mt.c -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
@@ -95,3 +95,4 @@ runnotcuda: run.cu
 clean:
 	rm -f run
 	rm -f runq
+	rm -f runmt
