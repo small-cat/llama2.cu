@@ -1,11 +1,7 @@
 /* Inference for Llama-2 Transformer model in pure C */
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <ctype.h>
-#include <time.h>
 #include <math.h>
-#include <string.h>
 #include <fcntl.h>
 #if defined _WIN32
     #include "win.h"
@@ -14,75 +10,54 @@
     #include <sys/mman.h>
 #endif
 
+#include <assert.h>
+#include <sched.h>
+
+#include "common.h"
 #include "mt-vec.h"
+#include "run-vec-mt.h"
 
-#include <time.h>
-long llama_time_ms() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)(ts.tv_sec * 1000) + (long)(ts.tv_nsec / 1000000);
+// @brief set a barrier to synchronize threads
+static void thread_barrier(ComputeStateShared *shared) {
+  if (shared->n_threads == 1) return;
+
+#ifdef USE_OPENMP
+  #pragma omp barrier
+#else
+  atomic_int* n_barrier = &shared->n_barrier;
+  atomic_int* n_barrier_passed = &shared->n_barrier_passed;
+
+  int n_threads = shared->n_threads;
+  int passed_old = atomic_load(n_barrier_passed);
+
+  printf("n_threads:%d, passed_old:%d\n", n_threads, passed_old);
+
+  if (atomic_fetch_add(n_barrier, 1) == n_threads - 1) {
+    // thread increase n_barrier one by one, if n_barrier == n_threads - 1
+    // the last thread arrived
+    atomic_store(n_barrier, 0);
+    atomic_fetch_add(n_barrier_passed, 1);
+  } else {
+    // wait for other threads until all the threads reached the barrier
+    const int n_spin_before_sleep = 100000;
+    while (1) {
+      for (int i = 0; i < n_spin_before_sleep; i++) {
+        if (atomic_load(n_barrier_passed) != passed_old) {
+          // the last thread had arrived and changed n_barrier_passed
+          return;
+        }
+
+      #if defined(__SSE3__)
+          _mm_pause();
+      #endif
+      }
+
+      // relinguish the cpu and let other thread to run, lower the current priority
+      sched_yield();  // a system call defined in linux
+    }
+  }
+#endif
 }
-
-// ----------------------------------------------------------------------------
-// Transformer model
-
-typedef struct {
-    int dim; // transformer dimension
-    int hidden_dim; // for ffn layers
-    int n_layers; // number of layers
-    int n_heads; // number of query heads
-    int n_kv_heads; // number of key/value heads (can be < query heads because of multiquery)
-    int vocab_size; // vocabulary size, usually 256 (byte-level)
-    int seq_len; // max sequence length
-} Config;
-
-typedef struct {
-    // token embedding table
-    float* token_embedding_table;    // (vocab_size, dim)
-    // weights for rmsnorms
-    float* rms_att_weight; // (layer, dim) rmsnorm weights
-    float* rms_ffn_weight; // (layer, dim)
-    // weights for matmuls. note dim == n_heads * head_size
-    float* wq; // (layer, dim, n_heads * head_size)
-    float* wk; // (layer, dim, n_kv_heads * head_size)
-    float* wv; // (layer, dim, n_kv_heads * head_size)
-    float* wo; // (layer, n_heads * head_size, dim)
-    // weights for ffn
-    float* w1; // (layer, hidden_dim, dim)
-    float* w2; // (layer, dim, hidden_dim)
-    float* w3; // (layer, hidden_dim, dim)
-    // final rmsnorm
-    float* rms_final_weight; // (dim,)
-    // (optional) classifier weights for the logits, on the last layer
-    float* wcls;
-} TransformerWeights;
-
-typedef struct {
-    // current wave of activations
-    float *x; // activation at current time stamp (dim,)
-    float *xb; // same, but inside a residual branch (dim,)
-    float *xb2; // an additional buffer just for convenience (dim,)
-    float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
-    float *q; // query (dim,)
-    float *k; // key (dim,)
-    float *v; // value (dim,)
-    float *att; // buffer for scores/attention values (n_heads, seq_len)
-    float *logits; // output logits
-    // kv cache
-    float* key_cache;   // (layer, seq_len, dim)
-    float* value_cache; // (layer, seq_len, dim)
-} RunState;
-
-typedef struct {
-    Config config; // the hyperparameters of the architecture (the blueprint)
-    TransformerWeights weights; // the weights of the model
-    RunState state; // buffers for the "wave" of activations in the forward pass
-    // some more state needed to properly clean up the memory mapping (sigh)
-    int fd; // file descriptor for memory mapping
-    float* data; // memory mapped data pointer
-    ssize_t file_size; // size of the checkpoint file in bytes
-} Transformer;
 
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
@@ -225,9 +200,11 @@ inline static void llama_vec_scale_mul_f32(const int n, float* x, float* w,
 // 1. rms_norm
 // 2. mul weight
 // 3. add bias if bias is not null
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params) {
+  // rmsnorm runs as single thread
+  if (params->ith != 0) return;
+
   // calculate sum of squares
-  long start = llama_time_ms();
   float ss = 0.0f;
   for (int j = 0; j < size; j++) {
     ss += x[j] * x[j];
@@ -238,12 +215,10 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
   ss = 1.0f / sqrtf(ss);
 
   llama_vec_scale_mul_f32(size, o, weight, ss);
-
-  long end = llama_time_ms();
-  // printf("rmsnorm time: %ld ms\n", end - start);
 }
 #else
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params) {
+  if (params->ith != 0) return;
     // calculate sum of squares
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
@@ -373,7 +348,8 @@ void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim) {
   }
 }
 
-float* forward(Transformer* transformer, int token, int pos) {
+float* forward(Transformer* transformer, int token, int pos, ComputeParams *params) {
+    // TODO(@wuzhenyu): use params for each operators
 
     // a few convenience variables
     Config* p = &transformer->config;
@@ -394,7 +370,8 @@ float* forward(Transformer* transformer, int token, int pos) {
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, params);
+        // thread_barrier(params->shared);
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -415,11 +392,12 @@ float* forward(Transformer* transformer, int token, int pos) {
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
+        // ffn_inp = ggml_add(cur, inpSA)
         // residual connection back into x
         accum(x, s->xb2, dim);
 
         // ffn rmsnorm
-        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, params);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
@@ -432,36 +410,22 @@ float* forward(Transformer* transformer, int token, int pos) {
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
+        // in llama.cpp: llm_build_ffn
+        // w1 -> gate, w3 -> up, w2 -> down
+        // (silu(in * gate) * (in * up)) * down
+        // (silu(in * w1) * (in * w3)) * w2
+
         // residual connection
-        for (int i = 0; i < dim; i++) {
-            x[i] += s->xb[i];
-        }
+        accum(x, s->xb, dim);
     }
 
     // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
+    rmsnorm(x, x, w->rms_final_weight, dim, params);
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
-
-// ----------------------------------------------------------------------------
-// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
-
-typedef struct {
-    char *str;
-    int id;
-} TokenIndex;
-
-typedef struct {
-    char** vocab;
-    float* vocab_scores;
-    TokenIndex *sorted_vocab;
-    int vocab_size;
-    unsigned int max_token_length;
-    unsigned char byte_pieces[512]; // stores all single-byte strings
-} Tokenizer;
 
 int compare_tokens(const void *a, const void *b) {
     return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
@@ -655,23 +619,6 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     free(str_buffer);
 }
 
-// ----------------------------------------------------------------------------
-// The Sampler, which takes logits and returns a sampled token
-// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
-
-typedef struct {
-    float prob;
-    int index;
-} ProbIndex; // struct used when sorting probabilities during top-p sampling
-
-typedef struct {
-    int vocab_size;
-    ProbIndex* probindex; // buffer used in top-p sampling
-    float temperature;
-    float topp;
-    unsigned long long rng_state;
-} Sampler;
-
 int sample_argmax(float* probabilities, int n) {
     // return the index that has the highest probability
     int max_i = 0;
@@ -798,20 +745,75 @@ int sample(Sampler* sampler, float* logits) {
     return next;
 }
 
-// ----------------------------------------------------------------------------
-// utilities: time
+static void* llama_compute_thread(void *data) {
+    ComputeState* state = (ComputeState *) data;
+    Transformer* transformer = state->transformer;
+    int token = state->token;
+    int pos = state->pos;
 
-long time_in_ms() {
-    // return time in milliseconds, for benchmarking the model speed
-    struct timespec time;
-    clock_gettime(CLOCK_REALTIME, &time);
-    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+    set_numa_thread_affinity(state->ith);
+
+    ComputeParams params = {
+        .ith = state->ith,
+        .nth = state->shared->n_threads,
+        .shared = state->shared,
+    };
+
+    if (state->ith != 0) {
+        // TODO: multi-threads does not implement, only use the first thread
+        return 0;
+    }
+
+    forward(transformer, token, pos, &params);
+
+    return 0;
+}
+
+void compute_forward(Transformer *transformer, int token, int pos, int n_threads) {
+    assert(n_threads >= 1);
+
+    ComputeStateShared state_shared = {
+        n_threads,
+        0,          // n_barrier
+        0,          // n_barrier_passed
+        0           // current_chunk
+    };
+
+    // apply a buffer from stack
+    ComputeState* workers = (ComputeState *)alloca(sizeof(ComputeState) * n_threads); 
+    for (int i = 0; i < n_threads; ++i) {
+        workers[i] = (ComputeState) {
+            .transformer = transformer,
+            .token = token,
+            .pos = pos,
+            .tid = 0,
+            .ith = i,
+            .shared = &state_shared,
+        };
+    }
+
+    for (int i = 1; i < n_threads; ++i) {
+        const int rc = pthread_create(&workers[i].tid, NULL, llama_compute_thread, &workers[i]);
+        assert(rc == 0);
+    }
+
+    // main thread is also a worker thread
+    llama_compute_thread(&workers[0]);
+
+    if (n_threads > 1) {
+        for (int i = 1; i < n_threads; ++i) {
+            const int rc = pthread_join(workers[i].tid, NULL);
+            assert(rc == 0);
+        }
+    }
+
+    clear_numa_thread_affinity();
 }
 
 // ----------------------------------------------------------------------------
 // generation loop
 
-void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps, int n_threads) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
 
@@ -824,6 +826,9 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         exit(EXIT_FAILURE);
     }
 
+    // TODO(@wuzhenyu): how to statistic prefill time and decode time when use multi-threads
+    // TODO(@wuzhenyu): separate prefill and decode, prefill use prompt_tokens, but decode phase does not 
+
     // start the main loop
     long start = 0;  // used to time our code, only initialized after first iteration
     int next;        // will store the next token in the sequence
@@ -832,7 +837,10 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     while (pos < steps) {
 
         // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
+        // token means the idx in the vocabulary table
+        // float* logits = forward(transformer, token, pos);
+        compute_forward(transformer, token, pos, n_threads);
+        float* logits = transformer->state.logits;
 
         // advance the state machine
         if (pos < num_prompt_tokens - 1) {
@@ -884,175 +892,95 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
 
-void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
-          char *cli_user_prompt, char *cli_system_prompt, int steps) {
+void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
+          char* cli_user_prompt, char* cli_system_prompt, int steps,
+          int n_threads) {
+  // buffers for reading the system prompt and user prompt from stdin
+  // you'll notice they are soomewhat haphazardly and unsafely set atm
+  char system_prompt[512];
+  char user_prompt[512];
+  char rendered_prompt[1152];
+  int num_prompt_tokens = 0;
+  int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+  int user_idx;
 
-    // buffers for reading the system prompt and user prompt from stdin
-    // you'll notice they are soomewhat haphazardly and unsafely set atm
-    char system_prompt[512];
-    char user_prompt[512];
-    char rendered_prompt[1152];
-    int num_prompt_tokens = 0;
-    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
-    int user_idx;
-
-    // start the main loop
-    int8_t user_turn = 1; // user starts
-    int next;        // will store the next token in the sequence
-    int token;       // stores the current token to feed into the transformer
-    int prev_token;
-    int pos = 0;     // position in the sequence
-    while (pos < steps) {
-
-        // when it is the user's turn to contribute tokens to the dialog...
-        if (user_turn) {
-            // get the (optional) system prompt at position 0
-            if (pos == 0) {
-                // at position 0, the user can also contribute a system prompt
-                if (cli_system_prompt == NULL) {
-                    // system prompt was not passed in, attempt to get it from stdin
-                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
-                } else {
-                    // system prompt was passed in, use it
-                    strcpy(system_prompt, cli_system_prompt);
-                }
-            }
-            // get the user prompt
-            if (pos == 0 && cli_user_prompt != NULL) {
-                // user prompt for position 0 was passed in, use it
-                strcpy(user_prompt, cli_user_prompt);
-            } else {
-                // otherwise get user prompt from stdin
-                read_stdin("User: ", user_prompt, sizeof(user_prompt));
-            }
-            // render user/system prompts into the Llama 2 Chat schema
-            if (pos == 0 && system_prompt[0] != '\0') {
-                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
-                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
-            } else {
-                char user_template[] = "[INST] %s [/INST]";
-                sprintf(rendered_prompt, user_template, user_prompt);
-            }
-            // encode the rendered prompt into tokens
-            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
-            user_idx = 0; // reset the user index
-            user_turn = 0;
-            printf("Assistant: ");
-        }
-
-        // determine the token to pass into the transformer next
-        if (user_idx < num_prompt_tokens) {
-            // if we are still processing the input prompt, force the next prompt token
-            token = prompt_tokens[user_idx++];
+  // start the main loop
+  int8_t user_turn = 1;  // user starts
+  int next;              // will store the next token in the sequence
+  int token;  // stores the current token to feed into the transformer
+  int prev_token;
+  int pos = 0;  // position in the sequence
+  while (pos < steps) {
+    // when it is the user's turn to contribute tokens to the dialog...
+    if (user_turn) {
+      // get the (optional) system prompt at position 0
+      if (pos == 0) {
+        // at position 0, the user can also contribute a system prompt
+        if (cli_system_prompt == NULL) {
+          // system prompt was not passed in, attempt to get it from stdin
+          read_stdin("Enter system prompt (optional): ", system_prompt,
+                     sizeof(system_prompt));
         } else {
-            // otherwise use the next token sampled from previous turn
-            token = next;
+          // system prompt was passed in, use it
+          strcpy(system_prompt, cli_system_prompt);
         }
-        // EOS (=2) token ends the Assistant turn
-        if (token == 2) { user_turn = 1; }
-
-        // forward the transformer to get logits for the next token
-        float* logits = forward(transformer, token, pos);
-        next = sample(sampler, logits);
-        pos++;
-
-        if (user_idx >= num_prompt_tokens && next != 2) {
-            // the Assistant is responding, so print its output
-            char* piece = decode(tokenizer, token, next);
-            safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
-            fflush(stdout);
-        }
-        if (next == 2) { printf("\n"); }
-    }
-    printf("\n");
-    free(prompt_tokens);
-}
-
-
-// ----------------------------------------------------------------------------
-// CLI, include only if not testing
-#ifndef TESTING
-
-void error_usage() {
-    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
-    fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
-    fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
-    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
-    fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
-    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
-    fprintf(stderr, "  -i <string> input prompt\n");
-    fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
-    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
-    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
-    exit(EXIT_FAILURE);
-}
-
-int main(int argc, char *argv[]) {
-
-    // default parameters
-    char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "tokenizer.bin";
-    float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
-    float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
-    int steps = 256;            // number of steps to run for
-    char *prompt = NULL;        // prompt string
-    unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
-    char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
-
-    // poor man's C argparse so we can override the defaults above from the command line
-    if (argc >= 2) { checkpoint_path = argv[1]; } else { error_usage(); }
-    for (int i = 2; i < argc; i+=2) {
-        // do some basic validation
-        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
-        if (argv[i][0] != '-') { error_usage(); } // must start with dash
-        if (strlen(argv[i]) != 2) { error_usage(); } // must be -x (one dash, one letter)
-        // read in the args
-        if (argv[i][1] == 't') { temperature = atof(argv[i + 1]); }
-        else if (argv[i][1] == 'p') { topp = atof(argv[i + 1]); }
-        else if (argv[i][1] == 's') { rng_seed = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'n') { steps = atoi(argv[i + 1]); }
-        else if (argv[i][1] == 'i') { prompt = argv[i + 1]; }
-        else if (argv[i][1] == 'z') { tokenizer_path = argv[i + 1]; }
-        else if (argv[i][1] == 'm') { mode = argv[i + 1]; }
-        else if (argv[i][1] == 'y') { system_prompt = argv[i + 1]; }
-        else { error_usage(); }
+      }
+      // get the user prompt
+      if (pos == 0 && cli_user_prompt != NULL) {
+        // user prompt for position 0 was passed in, use it
+        strcpy(user_prompt, cli_user_prompt);
+      } else {
+        // otherwise get user prompt from stdin
+        read_stdin("User: ", user_prompt, sizeof(user_prompt));
+      }
+      // render user/system prompts into the Llama 2 Chat schema
+      if (pos == 0 && system_prompt[0] != '\0') {
+        char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
+        sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
+      } else {
+        char user_template[] = "[INST] %s [/INST]";
+        sprintf(rendered_prompt, user_template, user_prompt);
+      }
+      // encode the rendered prompt into tokens
+      encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens,
+             &num_prompt_tokens);
+      user_idx = 0;  // reset the user index
+      user_turn = 0;
+      printf("Assistant: ");
     }
 
-    // parameter validation/overrides
-    if (rng_seed <= 0) rng_seed = (unsigned int)time(NULL);
-    if (temperature < 0.0) temperature = 0.0;
-    if (topp < 0.0 || 1.0 < topp) topp = 0.9;
-    if (steps < 0) steps = 0;
-
-    // build the Transformer via the model .bin file
-    Transformer transformer;
-    build_transformer(&transformer, checkpoint_path);
-    if (steps == 0 || steps > transformer.config.seq_len) steps = transformer.config.seq_len; // ovrerride to ~max length
-
-    // build the Tokenizer via the tokenizer .bin file
-    Tokenizer tokenizer;
-    build_tokenizer(&tokenizer, tokenizer_path, transformer.config.vocab_size);
-
-    // build the Sampler
-    Sampler sampler;
-    build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
-
-    // run!
-    if (strcmp(mode, "generate") == 0) {
-        generate(&transformer, &tokenizer, &sampler, prompt, steps);
-    } else if (strcmp(mode, "chat") == 0) {
-        chat(&transformer, &tokenizer, &sampler, prompt, system_prompt, steps);
+    // determine the token to pass into the transformer next
+    if (user_idx < num_prompt_tokens) {
+      // if we are still processing the input prompt, force the next prompt
+      // token
+      token = prompt_tokens[user_idx++];
     } else {
-        fprintf(stderr, "unknown mode: %s\n", mode);
-        error_usage();
+      // otherwise use the next token sampled from previous turn
+      token = next;
+    }
+    // EOS (=2) token ends the Assistant turn
+    if (token == 2) {
+      user_turn = 1;
     }
 
-    // memory and file handles cleanup
-    free_sampler(&sampler);
-    free_tokenizer(&tokenizer);
-    free_transformer(&transformer);
-    return 0;
+    // forward the transformer to get logits for the next token
+    // float* logits = forward(transformer, token, pos);
+    compute_forward(transformer, token, pos, n_threads);
+    float* logits = transformer->state.logits;
+    next = sample(sampler, logits);
+    pos++;
+
+    if (user_idx >= num_prompt_tokens && next != 2) {
+      // the Assistant is responding, so print its output
+      char* piece = decode(tokenizer, token, next);
+      safe_printf(
+          piece);  // same as printf("%s", piece), but skips "unsafe" bytes
+      fflush(stdout);
+    }
+    if (next == 2) {
+      printf("\n");
+    }
+  }
+  printf("\n");
+  free(prompt_tokens);
 }
-#endif

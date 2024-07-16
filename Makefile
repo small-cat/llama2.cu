@@ -1,6 +1,7 @@
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
 CC = gcc
+CXX = g++
 # CUDA compiler
 NVCC = nvcc
 
@@ -31,8 +32,9 @@ runfast: run.c
 	$(CC) -Ofast -o runq runq.c -lm
 
 .PHONY: run-vecmt
-run-vecmt: run-vec-mt.c
-	$(CC) -DUSE_VECTORIZE -O3 -o runmt run-vec-mt.c -lm
+run-vecmt: common.c run-vec-mt.c main.c
+	$(CC) -DUSE_VECTORIZE -O3 -o runmt $^ -lm
+# $(CC) -DUSE_VECTORIZE -DUSE_OPENMP -O3 -o runmt $^ -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
@@ -85,6 +87,8 @@ runcuda: run.cu
 .PHONY: rundebugcuda
 rundebugcuda: run.cu
 	$(NVCC) -DUSE_CUDA -g -o runcuda run.cu -lm -lcublas
+	# use openmp
+	#$(NVCC) -DUSE_CUDA -g -o runcuda run.cu -lm -lcublas -Xcompiler -fopenmp -lgomp
 
 # run cuda source file, but use only CPU code to compare with run target.
 .PHONY: runnotcuda
