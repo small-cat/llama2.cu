@@ -6,6 +6,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
+// #define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -143,12 +145,15 @@ void free_transformer(Transformer* t);
 // operator implementations
 void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params);
 void softmax(float* x, int size);
-void matmul(float* xout, float* x, float* w, int n, int d);
-void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size);
+void matmul(float* xout, float* x, float* w, int n, int d,
+            ComputeParams* params);
+void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size, ComputeParams* params);
 void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
-                          int kv_mul, int head_size, int loff);
-void accum(float* a, float* b, int size);
-void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim);
+                          int kv_mul, int head_size, int loff,
+                          ComputeParams* params);
+void accum(float* a, float* b, int size, ComputeParams* params);
+void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim,
+                               ComputeParams* params);
 
 float* forward(Transformer* transformer, int token, int pos, ComputeParams *params);
 int compare_tokens(const void* a, const void* b);

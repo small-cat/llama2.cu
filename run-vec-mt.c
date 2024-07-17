@@ -30,8 +30,6 @@ static void thread_barrier(ComputeStateShared *shared) {
   int n_threads = shared->n_threads;
   int passed_old = atomic_load(n_barrier_passed);
 
-  printf("n_threads:%d, passed_old:%d\n", n_threads, passed_old);
-
   if (atomic_fetch_add(n_barrier, 1) == n_threads - 1) {
     // thread increase n_barrier one by one, if n_barrier == n_threads - 1
     // the last thread arrived
@@ -235,43 +233,152 @@ void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params)
 #endif
 
 void softmax(float* x, int size) {
-    // find max value (for numerical stability)
-    float max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) {
-            max_val = x[i];
-        }
+  // find max value (for numerical stability)
+  float max_val = x[0];
+  for (int i = 1; i < size; i++) {
+    if (x[i] > max_val) {
+      max_val = x[i];
     }
-    // exp and sum
-    float sum = 0.0f;
-    for (int i = 0; i < size; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-    // normalize
-    for (int i = 0; i < size; i++) {
-        x[i] /= sum;
-    }
+  }
+  // exp and sum
+  float sum = 0.0f;
+  for (int i = 0; i < size; i++) {
+    x[i] = expf(x[i] - max_val);
+    sum += x[i];
+  }
+  // normalize
+  for (int i = 0; i < size; i++) {
+    x[i] /= sum;
+  }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
+#ifdef USE_VECTORIZE
+static void vec_dot_f32(int n, float* xout, float* x, float* y) {
+  float sumf = 0.0f;
+  int np = (n & ~(GGML_F32_STEP - 1));    // n / GGML_F32_STEP
+  GGML_F32_VEC sum[GGML_F32_ARR] = {GGML_F32_VEC_ZERO};
+
+  GGML_F32_VEC ax[GGML_F32_ARR];
+  GGML_F32_VEC ay[GGML_F32_ARR];
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+      ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
+
+      sum[j] = GGML_F32_VEC_FMA(sum[j], ax[j], ay[j]);
     }
+  }
+
+  // reduce sum0...sumN to sum0
+  GGML_F32_VEC_REDUCE(sumf, sum);
+
+  // remainders
+  for (int i = np; i < n; ++i) {
+    sumf += x[i] * y[i];
+  }
+
+  *xout = sumf;
 }
 
-void RoPe_rotation(
-    int pos, RunState* s, int dim, int kv_dim,
-    int head_size) {  // s->q, s->k, freq_cis_real_row, freq_cis_imag_row,
-                      // p->n_heads, head_size) {
+static void compute_mul_mat_one_chunk(float* xout, float* x, float* w, int n,
+                                      int d, int ir0_start, int ir0_end,
+                                      int ir1_start, int ir1_end) {
+  // w(d, n) dot x(n,) -> xout(d, )
+
+  // block tiling, for gemv, 16 * 1
+  // int blck_0 = 1;
+  // int blck_1 = 16;
+  // int col_stride = row_size;
+
+  for (int iir1 = ir1_start; iir1 < ir1_end; iir1 += 1) { // per line
+    float* w_ptr = w + iir1 * n;
+    float* x_ptr = x;
+    float* dst_col = xout + iir1;
+
+    vec_dot_f32(n, dst_col, w_ptr, x_ptr);
+  }
+}
+
+void matmul(float* xout, float* x, float* w, int n, int d, ComputeParams* params) {
+  int ith = params->ith;
+  int nth = params->nth;
+
+  if (ith == 0) {
+    // the first unprocessed chunk is nth
+    atomic_store(&params->shared->current_chunk, nth);
+  }
+  thread_barrier(params->shared);
+  // all threads could fetch current_chunk and know the value
+
+  // gemv, (d, n) dot (n, ) -> (d, )
+  // split dest matrix along with d to chunks, so each thread could process one
+  // chunk, which means, each thread could process several lines gemv
+
+  // the following algorithm from llama.cpp
+  int chunk_size = 64;  // for gemv, a resonable chunk size ?
+  // int num_rows_per_vec_dot = 1;
+
+  int n_chunks = (d + chunk_size - 1) / chunk_size;   // number of chunks along xout rows (d,)
+  if (n_chunks < nth * 4) {
+    // https://github.com/ggerganov/llama.cpp/pull/6915
+    // seems more fast by this way
+    n_chunks = nth;   // parallelize by x(d, n) rows
+  }
+
+  // calc the number of elements in each chunk
+  int dr = (d + n_chunks - 1) / n_chunks;
+
+  // if set 4 threads, and n_chunks is 8
+  // ideally, 
+  // thread 0 process 0th and 4th chunk
+  // thread 1 process 1th and 5th chunk
+  // thread 2 process 2th and 6th chunk
+  // thread 3 process 3th and 7th chunk
+  // if thread 1 process slowly and thread 2 process fast, thread 2 could process
+  // 2th, 5th, 6th chunk, and thread 1 process only 1th chunk
+  int current_chunk = ith;
+  while (current_chunk < n_chunks) {
+    int ith_col = current_chunk % n_chunks; // current thread should process which chunk along dest rows
+
+    // dest matrix has only one column (gemv)
+    int ir0_start = 0;
+    int ir0_end = 1;
+
+    int ir1_start = ith_col * dr;
+    int ir1_end = MIN(ir1_start + dr, d);
+
+    compute_mul_mat_one_chunk(xout, x, w, n, d, ir0_start, ir0_end, ir1_start, ir1_end);
+
+    if (nth >= n_chunks)
+      break;
+
+    current_chunk = atomic_fetch_add(&params->shared->current_chunk, 1);
+  }
+}
+#else
+void matmul(float* xout, float* x, float* w, int n, int d,
+            ComputeParams* params) {
+  if (params->ith != 0) return;
+  // W (d,n) @ x (n,) -> xout (d,)
+  // by far the most amount of time is spent inside this little function
+  int i;
+// #pragma omp parallel for private(i)
+  for (i = 0; i < d; i++) {
+    float val = 0.0f;
+    for (int j = 0; j < n; j++) {
+      val += w[i * n + j] * x[j];
+    }
+    xout[i] = val;
+  }
+}
+#endif
+
+void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size,
+                   ComputeParams* params) {  // s->q, s->k, freq_cis_real_row,
+                                             // freq_cis_imag_row,
+                                             // p->n_heads, head_size) {
+  if (params->ith != 0) return;
+
   for (int i = 0; i < dim; i += 2) {
     int head_dim = i % head_size;
     float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -290,7 +397,9 @@ void RoPe_rotation(
 }
 
 void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
-                          int kv_mul, int head_size, int loff) {
+                          int kv_mul, int head_size, int loff, ComputeParams* params) {
+  if (params->ith != 0) return;
+
   int h;
 #pragma omp parallel for private(h)
   for (h = 0; h < p->n_heads; h++) {
@@ -331,13 +440,19 @@ void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
   }
 }
 
-void accum(float* a, float* b, int size) {
+void accum(float* a, float* b, int size, ComputeParams* params) {
+  if (params->ith != 0) return;
+
   for (int i = 0; i < size; i++) {
     a[i] += b[i];
   }
 }
 
-void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim) {
+void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* params) {
+  if (params->ith != 0) {
+    return;
+  }
+
   for (int i = 0; i < hidden_dim; i++) {
     float val = s->hb[i];
     // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
@@ -371,7 +486,7 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
 
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, params);
-        // thread_barrier(params->shared);
+        thread_barrier(params->shared);
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -379,36 +494,46 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, params);
+        thread_barrier(params->shared);
+
+        matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, params);
+        thread_barrier(params->shared);
+
+        matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, params);
+        thread_barrier(params->shared);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
-        RoPe_rotation(pos, s, dim, kv_dim, head_size);
+        RoPe_rotation(pos, s, dim, kv_dim, head_size, params);
 
         // multihead attention. iterate over all heads
-        multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff);
+        multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff, params);
 
         // final matmul to get the output of the attention
-        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
+        matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, params);
+        thread_barrier(params->shared);
 
         // ffn_inp = ggml_add(cur, inpSA)
         // residual connection back into x
-        accum(x, s->xb2, dim);
+        accum(x, s->xb2, dim, params);
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, params);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, params);
+        thread_barrier(params->shared);
+
+        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, params);
+        thread_barrier(params->shared);
 
         // SwiGLU non-linearity
-        f_silu_elementwise_mul_w3(s, hidden_dim);
+        f_silu_elementwise_mul_w3(s, hidden_dim, params);
 
         // final matmul to get the output of the ffn
-        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
+        matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, params);
+        thread_barrier(params->shared);
 
         // in llama.cpp: llm_build_ffn
         // w1 -> gate, w3 -> up, w2 -> down
@@ -416,14 +541,16 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         // (silu(in * w1) * (in * w3)) * w2
 
         // residual connection
-        accum(x, s->xb, dim);
+        accum(x, s->xb, dim, params);
     }
 
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, dim, params);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size, params);
+    thread_barrier(params->shared);
+
     return s->logits;
 }
 
@@ -759,10 +886,10 @@ static void* llama_compute_thread(void *data) {
         .shared = state->shared,
     };
 
-    if (state->ith != 0) {
-        // TODO: multi-threads does not implement, only use the first thread
-        return 0;
-    }
+    // if (state->ith != 0) {
+    //     // TODO: multi-threads does not implement, only use the first thread
+    //     return 0;
+    // }
 
     forward(transformer, token, pos, &params);
 
