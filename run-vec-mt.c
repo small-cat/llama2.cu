@@ -144,9 +144,22 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
+void show_config(Config* conf) {
+  printf("-----------------------CONFIGS---------------------\n");
+  printf("  dim: %d\n", conf->dim);
+  printf("  hidden_dim: %d\n", conf->hidden_dim);
+  printf("  n_layers: %d\n", conf->n_layers);
+  printf("  n_heads: %d\n", conf->n_heads);
+  printf("  n_kv_heads: %d\n", conf->n_kv_heads);
+  printf("  vocab_size: %d\n", conf->vocab_size);
+  printf("  seq_len: %d\n", conf->seq_len);
+  printf("---------------------------------------------------\n\n");
+}
+
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
+    show_config(&t->config);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
 }
@@ -161,6 +174,16 @@ void free_transformer(Transformer* t) {
 
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
+
+static void print_data(float* ptr, int start, int end, char* matrix_name,
+                       ComputeParams* params) {
+  if (params->ith != 0) return;
+  printf("\n------------------%s---------------\n", matrix_name);
+  for (int i = start; i < end; i++) {
+    printf("%f ", ptr[i]);
+  }
+  printf("\n");
+}
 
 #ifdef USE_VECTORIZE
 inline static void llama_vec_scale_mul_f32(const int n, float* x, float* w,
@@ -373,6 +396,51 @@ void matmul(float* xout, float* x, float* w, int n, int d,
 }
 #endif
 
+#ifdef USE_VECTORIZE
+void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size,
+                   ComputeParams* params) {
+  int ith = params->ith;
+  int nth = params->nth;
+
+  if (ith == 0) {
+    atomic_store(&params->shared->current_chunk, nth);
+  }
+  thread_barrier(params->shared);
+
+  int chunk_size = 64;  // each thread process 32*2 elements, v0, v1
+  int n_chunk = (dim + chunk_size - 1) / chunk_size;
+
+  if (nth > n_chunk) {
+    fprintf(stderr, "threads number %d greater than %d chunks\n", nth, n_chunk);
+    exit(EXIT_FAILURE);
+  }
+
+  int current_chunk = ith;
+  while (current_chunk < n_chunk) {
+    int cur_idx = current_chunk % n_chunk;
+    int ir0 = cur_idx * chunk_size;
+    int ir1 = MIN(ir0 + chunk_size, dim);
+
+    for (int i = ir0; i < ir1; i += 2) {
+      int head_dim = i % head_size;
+      float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+      float val = pos * freq;
+      float fcr = cosf(val);
+      float fci = sinf(val);
+      int rotn = i < kv_dim ? 2 : 1;
+      for (int v = 0; v < rotn; v++) {
+        float* vec = v == 0 ? s->q : s->k;
+        float v0 = vec[i];
+        float v1 = vec[i + 1];
+        vec[i] = v0 * fcr - v1 * fci;
+        vec[i + 1] = v0 * fci + v1 * fcr;
+      }
+    }
+
+    current_chunk = atomic_fetch_add(&params->shared->current_chunk, 1);
+  }
+}
+#else
 void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size,
                    ComputeParams* params) {  // s->q, s->k, freq_cis_real_row,
                                              // freq_cis_imag_row,
@@ -395,6 +463,7 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size,
     }
   }
 }
+#endif
 
 void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
                           int kv_mul, int head_size, int loff, ComputeParams* params) {
@@ -464,8 +533,6 @@ void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* param
 }
 
 float* forward(Transformer* transformer, int token, int pos, ComputeParams *params) {
-    // TODO(@wuzhenyu): use params for each operators
-
     // a few convenience variables
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -505,6 +572,8 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         RoPe_rotation(pos, s, dim, kv_dim, head_size, params);
+        thread_barrier(params->shared);
+        // print_data(s->q, 100, 120, "RoPe_rotation-q", params);
 
         // multihead attention. iterate over all heads
         multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff, params);

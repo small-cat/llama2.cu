@@ -168,6 +168,7 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize);
 void chat(Transformer* transformer, Tokenizer* tokenizer, Sampler* sampler,
           char* cli_user_prompt, char* cli_system_prompt, int steps,
           int n_threads);
+void show_config(Config* conf);
 
 // sampling
 int sample_argmax(float* probabilities, int n);
