@@ -50,6 +50,15 @@ inline static float32x4_t ggml_v_expf(float32x4_t x) {
                      vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
 }
 
+inline static float32x4_t ggml_v_silu(float32x4_t x) {
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t neg_x = vsubq_f32(zero, x);
+    const float32x4_t exp_neg_x = ggml_v_expf(neg_x);
+    const float32x4_t one_plus_exp_neg_x = vaddq_f32(one, exp_neg_x);
+    return vdivq_f32(x, one_plus_exp_neg_x);
+}
+
 #elif defined(__AVX512F__) && defined (__AVX512DQ__)
 inline static __m512 ggml_v_expf(__m512 x) {
   const __m512 r = _mm512_set1_ps(0x1.8p23f);
@@ -77,6 +86,17 @@ inline static __m512 ggml_v_expf(__m512 x) {
       _mm512_cmp_ps_mask(n, zero, _CMP_LE_OQ), _mm512_set1_ps(INFINITY), zero);
   return _mm512_mask_blend_ps(d, res, alt);
 }
+
+// computes silu x/(1+exp(-x)) in single precision vector
+inline static __m512 ggml_v_silu(__m512 x) {
+    const __m512 one = _mm512_set1_ps(1);
+    const __m512 zero = _mm512_setzero_ps();
+    const __m512 neg_x = _mm512_sub_ps(zero, x);
+    const __m512 exp_neg_x = ggml_v_expf(neg_x);
+    const __m512 one_plus_exp_neg_x = _mm512_add_ps(one, exp_neg_x);
+    return _mm512_div_ps(x, one_plus_exp_neg_x);
+}
+
 #endif
 static float vec_soft_max_f32(const int n, float * y, const float * x, float max) {
     int i = 0;
@@ -209,6 +229,22 @@ inline static void llama_vec_add_f32(const int n, float* x, float*  y) {
     x[i] += y[i];
   }
 #endif
+}
+
+static void vec_silu_f32(const int n, float * y, const float * x) {
+    int i = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        _mm512_storeu_ps(y + i, ggml_v_silu(_mm512_loadu_ps(x + i)));
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        vst1q_f32(y + i, ggml_v_silu(vld1q_f32(x + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        y[i] = y[i] / (1.0f + expf(-y[i]));
+    }
 }
 
 #endif
@@ -734,7 +770,7 @@ void accum(float* a, float* b, int size, ComputeParams* params) {
   }
   thread_barrier(params->shared);
 
-  int chunk_size = 64;
+  int chunk_size = 32; // TODO:select a reasonable chunk size
   int n_chunk = (size + chunk_size - 1) / chunk_size;
   
   int current_chunk = ith;
@@ -764,6 +800,34 @@ void accum(float* a, float* b, int size, ComputeParams* params) {
 }
 #endif
 
+#ifdef USE_VECTORIZE
+// silu(w1) * w3
+void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* params) {
+  int ith = params->ith;
+  int nth = params->nth;
+
+  if (ith == 0) {
+    atomic_store(&params->shared->current_chunk, nth);
+  }
+  thread_barrier(params->shared);
+
+  int chunk_size = 64;
+  int n_chunks = (hidden_dim + chunk_size - 1) / chunk_size;
+
+  int current_chunk = ith;
+  while (current_chunk < n_chunks) {
+    int chunk_idx = current_chunk % n_chunks;
+    int start = chunk_idx * chunk_size;
+    int end = MIN(start + chunk_size, hidden_dim);
+
+    float* w1 = s->hb + start;
+    vec_silu_f32(end - start, w1, w1);
+    llama_vec_scale_mul_f32(end - start, w1, s->hb2 + start, 1.0f);
+
+    current_chunk = atomic_fetch_add(&params->shared->current_chunk, 1);
+  }
+}
+#else
 void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* params) {
   if (params->ith != 0) {
     return;
@@ -778,6 +842,7 @@ void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* param
     s->hb[i] = val;
   }
 }
+#endif
 
 float* forward(Transformer* transformer, int token, int pos, ComputeParams *params) {
     // a few convenience variables
@@ -849,6 +914,7 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
 
         // SwiGLU non-linearity
         f_silu_elementwise_mul_w3(s, hidden_dim, params);
+        thread_barrier(params->shared);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, params);
