@@ -17,6 +17,202 @@
 #include "mt-vec.h"
 #include "run-vec-mt.h"
 
+#ifdef APPLE_ACC
+#include <Accelerate/Accelerate.h>
+#endif
+
+#ifdef USE_VECTORIZE
+#if defined(__ARM_NEON) && defined (__aarch64__)
+// adapted from arm limited optimized routine
+// the maximum error is 1.45358 plus 0.5 ulps
+// numbers above 88.38 will flush to infinity
+// numbers beneath -103.97 will flush to zero
+inline static float32x4_t ggml_v_expf(float32x4_t x) {
+    const float32x4_t r = vdupq_n_f32(0x1.8p23f);
+    const float32x4_t z = vfmaq_f32(r, x, vdupq_n_f32(0x1.715476p+0f));
+    const float32x4_t n = vsubq_f32(z, r);
+    const float32x4_t b = vfmsq_f32(vfmsq_f32(x, n, vdupq_n_f32(0x1.62e4p-1f)), n,
+                                    vdupq_n_f32(0x1.7f7d1cp-20f));
+    const uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_f32(z), 23);
+    const float32x4_t k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1))));
+    const uint32x4_t c = vcagtq_f32(n, vdupq_n_f32(126));
+    const float32x4_t u = vmulq_f32(b, b);
+    const float32x4_t j = vfmaq_f32(
+        vmulq_f32(vdupq_n_f32(0x1.ffffecp-1f), b),
+        vfmaq_f32(vfmaq_f32(vdupq_n_f32(0x1.fffdb6p-2f), vdupq_n_f32(0x1.555e66p-3f), b),
+                  vfmaq_f32(vdupq_n_f32(0x1.573e2ep-5f), vdupq_n_f32(0x1.0e4020p-7f), b), u), u);
+    if (!vpaddd_u64(vreinterpretq_u64_u32(c)))
+        return vfmaq_f32(k, j, k);
+    const uint32x4_t d = vandq_u32(vclezq_f32(n), vdupq_n_u32(0x82000000));
+    const float32x4_t s1 = vreinterpretq_f32_u32(vaddq_u32(d, vdupq_n_u32(0x7f000000)));
+    const float32x4_t s2 = vreinterpretq_f32_u32(vsubq_u32(e, d));
+    return vbslq_f32(vcagtq_f32(n, vdupq_n_f32(192)), vmulq_f32(s1, s1),
+                     vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)));
+}
+
+#elif defined(__AVX512F__) && defined (__AVX512DQ__)
+inline static __m512 ggml_v_expf(__m512 x) {
+  const __m512 r = _mm512_set1_ps(0x1.8p23f);
+  const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+  const __m512 n = _mm512_sub_ps(z, r);
+  const __m512 b =
+      _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                       _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+  const __mmask16 d =
+      _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+  const __m512 u = _mm512_mul_ps(b, b);
+  const __m512 j = _mm512_fmadd_ps(
+      _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b,
+                                      _mm512_set1_ps(0x1.573e2ep-5f)),
+                      u,
+                      _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b,
+                                      _mm512_set1_ps(0x1.fffdb6p-2f))),
+      u,
+      _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), b, _mm512_set1_ps(1.0F)));
+  const __m512 res = _mm512_scalef_ps(j, n);
+  if (_mm512_kortestz(d, d))
+    return res;
+  const __m512 zero = _mm512_setzero_ps();
+  const __m512 alt = _mm512_mask_blend_ps(
+      _mm512_cmp_ps_mask(n, zero, _CMP_LE_OQ), _mm512_set1_ps(INFINITY), zero);
+  return _mm512_mask_blend_ps(d, res, alt);
+}
+#endif
+static float vec_soft_max_f32(const int n, float * y, const float * x, float max) {
+    int i = 0;
+    float sum = 0;
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+    for (; i + 15 < n; i += 16) {
+        __m512 val = ggml_v_expf(_mm512_sub_ps(_mm512_loadu_ps(x + i),
+                                               _mm512_set1_ps(max)));
+        _mm512_storeu_ps(y + i, val);
+        sum += (float)_mm512_reduce_add_ps(val);
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    for (; i + 3 < n; i += 4) {
+        float32x4_t val = ggml_v_expf(vsubq_f32(vld1q_f32(x + i),
+                                                vdupq_n_f32(max)));
+        vst1q_f32(y + i, val);
+        sum += (float)vaddvq_f32(val);
+    }
+#endif
+    for (; i < n; ++i) {
+        float val = expf(x[i] - max);
+        sum += (float)val;
+        y[i] = val;
+    }
+    return sum;
+}
+
+static void vec_dot_f32(int n, float* xout, float* x, float* y) {
+  float sumf = 0.0f;
+  int np = (n & ~(GGML_F32_STEP - 1));    // n / GGML_F32_STEP
+  GGML_F32_VEC sum[GGML_F32_ARR] = {GGML_F32_VEC_ZERO};
+
+  GGML_F32_VEC ax[GGML_F32_ARR];
+  GGML_F32_VEC ay[GGML_F32_ARR];
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+      ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
+
+      sum[j] = GGML_F32_VEC_FMA(sum[j], ax[j], ay[j]);
+    }
+  }
+
+  // reduce sum0...sumN to sum0
+  GGML_F32_VEC_REDUCE(sumf, sum);
+
+  // remainders
+  for (int i = np; i < n; ++i) {
+    sumf += x[i] * y[i];
+  }
+
+  *xout = sumf;
+}
+
+inline static void llama_vec_scale_mul_f32(const int n, float* x, float* w,
+                                           const float scale) {
+  // for (int i = 0; i < n; i++) {
+  //   x[i] = x[i] * scale * w[i];
+  // }
+  const int np = (n & ~(GGML_F32_STEP - 1));  // n / GGML_F32_STEP
+  GGML_F32_VEC vx = GGML_F32_VEC_SET1(
+      scale);  // vx is a vector contains number of 16 floats all equal to scale
+  GGML_F32_VEC aw[GGML_F32_ARR];  // store input weights
+  GGML_F32_VEC ax[GGML_F32_ARR];  // store input x
+
+  // GGML_F32_STEP = GGML_F32_ARR * GGML_F32_EPR
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+      ax[j] = GGML_F32_VEC_MUL(ax[j], vx);  // xi * scale
+
+      aw[j] = GGML_F32_VEC_LOAD(w + i + j * GGML_F32_EPR);
+      ax[j] = GGML_F32_VEC_MUL(ax[j], aw[j]); // xi * scale * wi
+
+      GGML_F32_VEC_STORE(x + i + j * GGML_F32_EPR, ax[j]);
+    }
+  }
+
+  // the remains elements
+  for (int i = np; i < n; i++) {
+    x[i] = x[i] * scale * w[i];
+  }
+}
+
+// xout[i] = y[i] * v
+inline static void llama_vec_scale_f32(const int n, float* xout, float* y, const float v) {
+#ifdef APPLE_ACC
+  vDSP_vsmul(y, 1, &v, xout, 1, n);
+#else
+  int np = (n & ~(GGML_F32_STEP - 1));
+  GGML_F32_VEC ay[GGML_F32_ARR];
+  GGML_F32_VEC vy = GGML_F32_VEC_SET1(v);
+
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
+      ay[j] = GGML_F32_VEC_MUL(ay[j], vy);)
+
+      GGML_F32_VEC_STORE(xout + i + j * GGML_F32_EPR, ay[j]);
+    }
+  }
+
+  for (int i = np; i < n; i++) {
+    xout[i] = y[i] * v;
+  }
+#endif
+}
+
+// x[i] += y[i]
+inline static void llama_vec_add_f32(const int n, float* x, float*  y) {
+#ifdef APPLE_ACC
+  vDSP_vadd(x, 1, y, 1, x, 1, n);
+#else
+  int np = (n & ~(GGML_F32_STEP - 1));
+  GGML_F32_VEC ax[GGML_F32_ARR];
+  GGML_F32_VEC ay[GGML_F32_ARR];
+
+  for (int i = 0; i < np; i += GGML_F32_STEP) {
+    for (int j = 0; j < GGML_F32_ARR; j++) {
+      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
+      ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
+      GGML_F32_VEC_ADD(ax[j], ay[j]);
+
+      GGML_F32_VEC_STORE(x + i + j * GGML_F32_EPR, ax[j]);
+    }
+  }
+
+  // leftovers
+  for (int i = np; i < n; i++) {
+    x[i] += y[i];
+  }
+#endif
+}
+
+#endif
+
 // @brief set a barrier to synchronize threads
 static void thread_barrier(ComputeStateShared *shared) {
   if (shared->n_threads == 1) return;
@@ -186,35 +382,6 @@ static void print_data(float* ptr, int start, int end, char* matrix_name,
 }
 
 #ifdef USE_VECTORIZE
-inline static void llama_vec_scale_mul_f32(const int n, float* x, float* w,
-                                           const float scale) {
-  // for (int i = 0; i < n; i++) {
-  //   x[i] = x[i] * scale * w[i];
-  // }
-  const int np = (n & ~(GGML_F32_STEP - 1));  // n / GGML_F32_STEP
-  GGML_F32_VEC vx = GGML_F32_VEC_SET1(
-      scale);  // vx is a vector contains number of 16 floats all equal to scale
-  GGML_F32_VEC aw[GGML_F32_ARR];  // store input weights
-  GGML_F32_VEC ax[GGML_F32_ARR];  // store input x
-
-  // GGML_F32_STEP = GGML_F32_ARR * GGML_F32_EPR
-  for (int i = 0; i < np; i += GGML_F32_STEP) {
-    for (int j = 0; j < GGML_F32_ARR; j++) {
-      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
-      ax[j] = GGML_F32_VEC_MUL(ax[j], vx);  // xi * scale
-
-      aw[j] = GGML_F32_VEC_LOAD(w + i + j * GGML_F32_EPR);
-      ax[j] = GGML_F32_VEC_MUL(ax[j], aw[j]); // xi * scale * wi
-
-      GGML_F32_VEC_STORE(x + i + j * GGML_F32_EPR, ax[j]);
-    }
-  }
-
-  // the remains elements
-  for (int i = np; i < n; i++) {
-    x[i] = x[i] * scale * w[i];
-  }
-}
 
 // 1 / sqrt(sum(xi ^ xi)/size + epsilon) * xi * wi
 // llama.cpp wrap above to llm_build_norm, consist of three node
@@ -255,6 +422,24 @@ void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params)
 }
 #endif
 
+#ifdef USE_VECTORIZE
+void softmax(float* x, int size) {
+  float max_val = x[0];
+#ifdef APPLE_ACC
+  vDSP_maxv(x, 1, &max_val, size);
+#else
+  for (int i = 1; i < size; ++i) {
+    // max_val = fmaxf(max_val, x[i]);
+    // precious ???
+    max_val = MAX(max_val, x[i]);
+  }
+#endif
+
+  float sum = vec_soft_max_f32(size, x, x, max_val);
+  sum = 1.0 / sum;
+  llama_vec_scale_f32(size, x, x, sum);
+}
+#else
 void softmax(float* x, int size) {
   // find max value (for numerical stability)
   float max_val = x[0];
@@ -274,35 +459,9 @@ void softmax(float* x, int size) {
     x[i] /= sum;
   }
 }
+#endif
 
 #ifdef USE_VECTORIZE
-static void vec_dot_f32(int n, float* xout, float* x, float* y) {
-  float sumf = 0.0f;
-  int np = (n & ~(GGML_F32_STEP - 1));    // n / GGML_F32_STEP
-  GGML_F32_VEC sum[GGML_F32_ARR] = {GGML_F32_VEC_ZERO};
-
-  GGML_F32_VEC ax[GGML_F32_ARR];
-  GGML_F32_VEC ay[GGML_F32_ARR];
-  for (int i = 0; i < np; i += GGML_F32_STEP) {
-    for (int j = 0; j < GGML_F32_ARR; j++) {
-      ax[j] = GGML_F32_VEC_LOAD(x + i + j * GGML_F32_EPR);
-      ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
-
-      sum[j] = GGML_F32_VEC_FMA(sum[j], ax[j], ay[j]);
-    }
-  }
-
-  // reduce sum0...sumN to sum0
-  GGML_F32_VEC_REDUCE(sumf, sum);
-
-  // remainders
-  for (int i = np; i < n; ++i) {
-    sumf += x[i] * y[i];
-  }
-
-  *xout = sumf;
-}
-
 static void compute_mul_mat_one_chunk(float* xout, float* x, float* w, int n,
                                       int d, int ir0_start, int ir0_end,
                                       int ir1_start, int ir1_end) {
@@ -465,8 +624,63 @@ void RoPe_rotation(int pos, RunState* s, int dim, int kv_dim, int head_size,
 }
 #endif
 
+#ifdef USE_VECTORIZE
+// llama2 use grouped query attention.
+// kv_dim = (dim * kv_heads) / n_heads
+// kv_mul = n_heads / kv_heads, it means query split into kv_mul groups
+// softmax(QK/sqrt(k_dim)) * V
+// score should calc for each previous tokens
+// att_outi = vi * (score_t1 + score_t2 + ... + score_tN), N means number of previous tokens
 void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
-                          int kv_mul, int head_size, int loff, ComputeParams* params) {
+                          int kv_mul, int head_size, int loff,
+                          ComputeParams* params) {
+  int ith = params->ith;
+  int nth = params->nth;
+
+  if (ith == 0) {
+    atomic_store(&params->shared->current_chunk, nth);
+  }
+  thread_barrier(params->shared);
+
+  // compute one head per thread once
+  int h = ith;
+  while (h < p->n_heads) {
+    int cur_head = h % p->n_heads;
+    float* q = s->q + cur_head * head_size; // get query head for current head
+    float* att = s->att + cur_head * p->seq_len;
+
+    for (int t = 0; t <= pos; ++t) {
+      // get k for current head, number of kv_heads q share the same k/v (gqa)
+      float* k = s->key_cache   + loff + t * kv_dim + (h / kv_mul) * head_size;
+      float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      float score = 0.0f;
+      vec_dot_f32(head_size, &score, q, k);
+
+      att[t] = score / sqrtf(head_size);
+    }
+
+    softmax(att, pos + 1);  // if use flash attn, calc softmax iteratively, only need one for loop
+
+    float* xb = s->xb + cur_head * head_size;
+    memset(xb, 0, head_size * sizeof(float));
+    float tmp[head_size];
+    for (int t = 0; t <= pos; ++t) {
+      float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
+      llama_vec_scale_f32(head_size, tmp, v, att[t]);
+      llama_vec_add_f32(head_size, xb, tmp);
+
+      // for (int i = 0; i < head_size; i++) {
+      //   xb[i] += att[t] * v[i];
+      // }
+    }
+
+    h = atomic_fetch_add(&params->shared->current_chunk, 1);
+  }
+}
+#else
+void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
+                          int kv_mul, int head_size, int loff,
+                          ComputeParams* params) {
   if (params->ith != 0) return;
 
   int h;
@@ -508,14 +722,47 @@ void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
     }
   }
 }
+#endif
 
+#ifdef USE_VECTORIZE
+void accum(float* a, float* b, int size, ComputeParams* params) {
+  int ith = params->ith;
+  int nth = params->nth;
+
+  if (ith == 0) {
+    atomic_store(&params->shared->current_chunk, nth);
+  }
+  thread_barrier(params->shared);
+
+  int chunk_size = 64;
+  int n_chunk = (size + chunk_size - 1) / chunk_size;
+  
+  int current_chunk = ith;
+  while (current_chunk < n_chunk) {
+    int chunk_idx = current_chunk % n_chunk;
+    int start = chunk_idx * chunk_size;
+    int end = MIN(start + chunk_size, size);
+    // llama_vec_add_f32(end - start, a + start, b + start);
+    for (int i = start; i < end; i++) {
+      a[i] += b[i];
+    }
+
+    current_chunk = atomic_fetch_add(&params->shared->current_chunk, 1);
+    // printf("current_chunk: %d, n_chunk: %d, size: %d\n", current_chunk, n_chunk, size);
+  }
+}
+#else
 void accum(float* a, float* b, int size, ComputeParams* params) {
   if (params->ith != 0) return;
 
   for (int i = 0; i < size; i++) {
     a[i] += b[i];
   }
+
+  // on mac, llama_vec_add_f32 does not work better than for loop
+  // llama_vec_add_f32(size, a, b)
 }
+#endif
 
 void f_silu_elementwise_mul_w3(RunState* s, int hidden_dim, ComputeParams* params) {
   if (params->ith != 0) {
@@ -577,6 +824,7 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
 
         // multihead attention. iterate over all heads
         multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff, params);
+        thread_barrier(params->shared);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, params);
@@ -585,9 +833,11 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         // ffn_inp = ggml_add(cur, inpSA)
         // residual connection back into x
         accum(x, s->xb2, dim, params);
+        thread_barrier(params->shared);
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, params);
+        thread_barrier(params->shared);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
@@ -611,10 +861,12 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
 
         // residual connection
         accum(x, s->xb, dim, params);
+        thread_barrier(params->shared);
     }
 
     // final rmsnorm
     rmsnorm(x, x, w->rms_final_weight, dim, params);
+    thread_barrier(params->shared);
 
     // classifier into logits
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size, params);
@@ -954,11 +1206,6 @@ static void* llama_compute_thread(void *data) {
         .nth = state->shared->n_threads,
         .shared = state->shared,
     };
-
-    // if (state->ith != 0) {
-    //     // TODO: multi-threads does not implement, only use the first thread
-    //     return 0;
-    // }
 
     forward(transformer, token, pos, &params);
 

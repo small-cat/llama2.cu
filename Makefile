@@ -31,9 +31,19 @@ runfast: run.c
 	$(CC) -Ofast -o run run.c -lm
 	$(CC) -Ofast -o runq runq.c -lm
 
+SYSNAME := $(shell uname)
+ifeq ($(SYSNAME), Darwin)
+	VECMT_FLAGS := -DAPPLE_ACC -DUSE_VECTORIZE
+	EXTRA_LDFLAGS := -framework Accelerate
+else ifeq ($(SYSNAME), Linux)
+	VECMT_FLAGS := -DUSE_VECTORIZE
+else
+	VECMT_FLAGS :=
+endif
+
 .PHONY: run-vecmt
 run-vecmt: common.c run-vec-mt.c main.c
-	$(CC) -DUSE_VECTORIZE -O3 -o runmt $^ -lm
+	$(CC) $(VECMT_FLAGS) -O3 -o runmt $^ -lm $(EXTRA_LDFLAGS)
 # $(CC) -DUSE_VECTORIZE -DUSE_OPENMP -O3 -o runmt $^ -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs
