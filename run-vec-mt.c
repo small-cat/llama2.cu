@@ -205,7 +205,7 @@ inline static void llama_vec_scale_f32(const int n, float* xout, float* y, const
 }
 
 // x[i] += y[i]
-inline static void llama_vec_add_f32(const int n, float* x, float*  y) {
+inline static void llama_vec_add_f32(const int n, float* x, float* y) {
 #ifdef APPLE_ACC
   vDSP_vadd(x, 1, y, 1, x, 1, n);
 #else
@@ -408,6 +408,7 @@ void free_transformer(Transformer* t) {
 
 static void print_data(float* ptr, int start, int end, char* matrix_name,
                        ComputeParams* params) {
+  return;
   if (params->ith != 0) return;
   printf("\n------------------%s---------------\n", matrix_name);
   for (int i = start; i < end; i++) {
@@ -457,22 +458,31 @@ void rmsnorm(float* o, float* x, float* weight, int size, ComputeParams* params)
 }
 #endif
 
-#ifdef USE_VECTORIZE
+// #ifdef USE_VECTORIZE
+#if 0
 void softmax(float* x, int size) {
   float max_val = x[0];
 #ifdef APPLE_ACC
   vDSP_maxv(x, 1, &max_val, size);
 #else
   for (int i = 1; i < size; ++i) {
-    // max_val = fmaxf(max_val, x[i]);
+    max_val = fmaxf(max_val, x[i]);
     // precious ???
-    max_val = MAX(max_val, x[i]);
+    // max_val = MAX(max_val, x[i]);
   }
 #endif
+  printf("\nsoftmax maxnum is: %f\n", max_val);
 
   float sum = vec_soft_max_f32(size, x, x, max_val);
+  printf("\nsum is %f\n", sum);
   sum = 1.0 / sum;
   llama_vec_scale_f32(size, x, x, sum);
+
+  printf("\nsoftmax:xout----------------\n");
+  for (int i = 100; i < 120; ++i) {
+    printf("%f ", x[i]);
+  }
+  printf("\n");
 }
 #else
 void softmax(float* x, int size) {
@@ -687,7 +697,6 @@ void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
     for (int t = 0; t <= pos; ++t) {
       // get k for current head, number of kv_heads q share the same k/v (gqa)
       float* k = s->key_cache   + loff + t * kv_dim + (h / kv_mul) * head_size;
-      float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
       float score = 0.0f;
       vec_dot_f32(head_size, &score, q, k);
 
@@ -701,12 +710,13 @@ void multi_head_attention(int pos, Config* p, RunState* s, int kv_dim,
     float tmp[head_size];
     for (int t = 0; t <= pos; ++t) {
       float* v = s->value_cache + loff + t * kv_dim + (h / kv_mul) * head_size;
-      llama_vec_scale_f32(head_size, tmp, v, att[t]);
-      llama_vec_add_f32(head_size, xb, tmp);
+      // llama_vec_scale_f32(head_size, &tmp[0], v, att[t]);
+      // llama_vec_add_f32(head_size, xb, &tmp[0]); 
 
-      // for (int i = 0; i < head_size; i++) {
-      //   xb[i] += att[t] * v[i];
-      // }
+      for (int i = 0; i < head_size; i++) {
+        xb[i] += att[t] * v[i];
+        // xb[i] += tmp[i];
+      }
     }
 
     h = atomic_fetch_add(&params->shared->current_chunk, 1);
@@ -865,6 +875,7 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim, params);
         thread_barrier(params->shared);
+        print_data(s->xb, 100, 120, "rmsnorm:s->xb", params);
 
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
@@ -874,50 +885,62 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         // qkv matmuls for this position
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim, params);
         thread_barrier(params->shared);
+        print_data(s->q, 100, 120, "matmul:s->q", params);
 
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim, params);
         thread_barrier(params->shared);
+        print_data(s->k, 100, 120, "matmul:s->k", params);
 
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim, params);
         thread_barrier(params->shared);
+        print_data(s->v, 100, 120, "matmul:s->v", params);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         RoPe_rotation(pos, s, dim, kv_dim, head_size, params);
         thread_barrier(params->shared);
-        // print_data(s->q, 100, 120, "RoPe_rotation-q", params);
+        print_data(s->q, 100, 120, "RoPe_rotation-q", params);
+        print_data(s->k, 100, 120, "RoPe_rotation-k", params);
 
         // multihead attention. iterate over all heads
         multi_head_attention(pos, p, s, kv_dim, kv_mul, head_size, loff, params);
         thread_barrier(params->shared);
+        print_data(s->xb, 100, 120, "multi_head_attn:s->xb", params);
 
         // final matmul to get the output of the attention
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim, params);
         thread_barrier(params->shared);
+        print_data(s->xb2, 100, 120, "matmul:s->xb2", params);
 
         // ffn_inp = ggml_add(cur, inpSA)
         // residual connection back into x
         accum(x, s->xb2, dim, params);
         thread_barrier(params->shared);
+        print_data(x, 100, 120, "accum:x", params);
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim, params);
         thread_barrier(params->shared);
+        print_data(s->xb, 100, 120, "rmsnorm:s->xb", params);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim, params);
         thread_barrier(params->shared);
+        print_data(s->hb, 100, 120, "matmul:s->hb", params);
 
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim, params);
         thread_barrier(params->shared);
+        print_data(s->hb2, 100, 120, "matmul:s->hb2", params);
 
         // SwiGLU non-linearity
         f_silu_elementwise_mul_w3(s, hidden_dim, params);
         thread_barrier(params->shared);
+        print_data(s->hb, 100, 120, "f_silu_elementwise_mul_w3:s->hb", params);
 
         // final matmul to get the output of the ffn
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim, params);
         thread_barrier(params->shared);
+        print_data(s->xb, 100, 120, "matmul:s->xb", params);
 
         // in llama.cpp: llm_build_ffn
         // w1 -> gate, w3 -> up, w2 -> down
@@ -927,6 +950,7 @@ float* forward(Transformer* transformer, int token, int pos, ComputeParams *para
         // residual connection
         accum(x, s->xb, dim, params);
         thread_barrier(params->shared);
+        print_data(x, 100, 120, "accum:x", params);
     }
 
     // final rmsnorm
