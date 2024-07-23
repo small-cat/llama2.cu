@@ -37,13 +37,18 @@ ifeq ($(SYSNAME), Darwin)
 	EXTRA_LDFLAGS := -framework Accelerate
 else ifeq ($(SYSNAME), Linux)
 	VECMT_FLAGS := -DUSE_VECTORIZE
+	EXTRA_LDFLAGS := -lpthread
 else
 	VECMT_FLAGS :=
 endif
 
+# avx512: -mavx512f -mavx512bw
+# fma: -mfma
+# avx: -mavx
+VECMT_FLAGS += -mavx512bw -mavx512f
 .PHONY: run-vecmt
 run-vecmt: common.c run-vec-mt.c main.c
-	$(CC) $(VECMT_FLAGS) -O3 -o runmt $^ -lm $(EXTRA_LDFLAGS)
+	$(CC) $(VECMT_FLAGS) -I. -O3 -o runmt $^ -lm $(EXTRA_LDFLAGS)
 # $(CC) -DUSE_VECTORIZE -DUSE_OPENMP -O3 -o runmt $^ -lm
 
 # additionally compiles with OpenMP, allowing multithreaded runs

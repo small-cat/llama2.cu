@@ -11,7 +11,6 @@
 #endif
 
 #include <assert.h>
-#include <sched.h>
 
 #include "common.h"
 #include "mt-vec.h"
@@ -193,7 +192,7 @@ inline static void llama_vec_scale_f32(const int n, float* xout, float* y, const
   for (int i = 0; i < np; i += GGML_F32_STEP) {
     for (int j = 0; j < GGML_F32_ARR; j++) {
       ay[j] = GGML_F32_VEC_LOAD(y + i + j * GGML_F32_EPR);
-      ay[j] = GGML_F32_VEC_MUL(ay[j], vy);)
+      ay[j] = GGML_F32_VEC_MUL(ay[j], vy);
 
       GGML_F32_VEC_STORE(xout + i + j * GGML_F32_EPR, ay[j]);
     }

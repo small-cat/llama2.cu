@@ -16,8 +16,13 @@
 //   number of elements to fit in a single register
 //
 
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__) || defined(__SSE3__) || defined(__SSE__)
+#include <immintrin.h>
+#endif
 
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA)
 // F32 NEON
 
 #define GGML_F32_STEP 16
