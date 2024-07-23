@@ -10,9 +10,8 @@
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/sysctl.h>
-#elif defined(__linux__)
-#include <unistd.h>
 #endif
+#include <unistd.h>
 
 #define LLAMA_DEFAULT_SEED 0xFFFFFFFF
 #define DEFAULT_TOKENIZER_PATH "tokenizer.bin"
